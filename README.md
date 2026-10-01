@@ -37,14 +37,14 @@ nanorust run -b mod_calls_FP27_ES1_tel1rif1rif2_RefBT1mono_modl610FT11.bam \
 |---|---|---|
 | `-o, --out-prefix` | | writes `<prefix>_nanoT_alldata.rds` and `<prefix>.bw` |
 | `--rds`, `--bw` | | explicit output paths (either can be omitted) |
-| `-t, --threads` | all cores | **total** CPU cores used (see below) |
+| `-t, --threads` | see below | **total** CPU cores used |
 | `--no-supplementary` | off | drop supplementary mappings (R keeps same-chrom/strand ones) |
 | `--max-dist` | 15000 | `supp_filter(max_dist=)` |
 | `--min-len` | 1 | `extract.local.signal(min_len=)` |
 | `--bin-size` | 1000 | signalbin bin size |
 | `--cov-bin-size` | 50 | bamCoverage `--binSize` |
 | `--exclude-prefix` | chrM | chromosomes excluded from the signal (step 01 `^chrM`) |
-| `--preset` | brdu | `brdu` (BrdU) or `bredu` (BrdU + EdU), see below |
+| `--preset` | brdu | `brdu` (BrdU), `edu` (EdU) or `bredu` (BrdU + EdU), see below |
 | `--mod` | | override the preset with one or two modifications: `B`, `E`, or MM specs like `T+B,T+E` (same base) |
 | `--source` | auto | supplementary rules: `auto` (from the MM tags), `dorado`, `dnascent` |
 | `--binarise THR` | off | R's `binarise`/`bin_thr` for every modification: `signal<X>` uses `prob < THR ? 0 : 1` |
@@ -56,8 +56,8 @@ The producer of the BAM is recognised from its `MM` tags, and the matching R par
 
 | BAM | MM entries | supplementary rules | `--preset brdu` | `--preset bredu` |
 |---|---|---|---|---|
-| dorado / Remora | `T+B.` `T+E.` | flag 0/16, or 2048/2064 with first `SA` entry on the same chrom/strand, then `supp_filter` | `parsing_DoradoRemora_v18_Br.r` | `parsing_DoradoRemora_v18_BrE.r` |
-| DNAscent 4 | `N+b?` `N+e?` | all mapped, non-secondary records; no `supp_filter` | — | `parsing_DS421_v2.r` |
+| dorado / Remora | `T+B.` `T+E.` | flag 0/16, or 2048/2064 with first `SA` entry on the same chrom/strand, then `supp_filter` | `parsing_DoradoRemora_v18_Br.r` (`edu`: `_v18_E.r`) | `parsing_DoradoRemora_v18_BrE.r` |
+| DNAscent 4 | `N+b?` `N+e?` | all mapped, non-secondary records; no `supp_filter` | v18 layout, DS421 rules | `parsing_DS421_v2.r` |
 
 Output columns: with one modification X, `signalbin(positions, signalX)`, `med_signal`, `med_signalbin`
 (v18 layout); with two modifications X and Y, `signalbin(positions, signalX, signalY)`,
@@ -71,8 +71,10 @@ same base.
 
 ### CPU budget (`-t`)
 
-`-t N` is the total number of cores the run uses, so it can be set to the CPUs allocated by
-HTCondor (`request_cpus`) or SLURM (`--cpus-per-task`):
+`-t N` is the total number of cores the run uses. Without `-t`, nanorust uses
+`SLURM_CPUS_PER_TASK`, else `OMP_NUM_THREADS` (HTCondor sets it to `request_cpus`), else every core
+available to the process, and prints which one it used. On a shared server without a scheduler
+variable, always pass `-t`:
 
 * `-t 1`: everything runs in one thread.
 * `-t 2`: one thread reads and decompresses, one processes records.
@@ -80,8 +82,9 @@ HTCondor (`request_cpus`) or SLURM (`--cpus-per-task`):
   left to the light file-reading and record-splitting threads. Output (RDS compression, then
   bigWig) runs after processing, within the same N.
 
-Measured average busy cores on a 3.8 GB BAM: 0.99 (`-t 1`), 1.5 (`-t 2`), 2.3 (`-t 3`),
-3.5 (`-t 4`), 5.2 (`-t 6`). Results are identical for any `-t`.
+Measured on Linux (human, 10,000 reads, `--preset bredu`, sampled every 0.2 s): average / peak busy
+cores 0.97 / 1.10 (`-t 1`), 1.32 / 1.62 (`-t 2`), 1.97 / 2.33 (`-t 3`), 2.78 / 3.19 (`-t 4`).
+`scripts/cpu_monitor.sh -- nanorust run ...` reports this for any run. Results are identical for any `-t`.
 
 `-b -` reads the BAM from stdin, e.g. streaming from a server without a local copy:
 
@@ -120,7 +123,9 @@ ssh server cat /path/mod_calls.bam | nanorust run -b - -o PREFIX
 * **Downstream row-order effect**: step 04's `mean`/`var` sum `signalB` in `alldata` row order, so
   with nanorust's order `mean_br_bin`/`varbin` can differ from the R pipeline in the last bit
   (≤ 4e-16); `nbin` and the median filter are identical. With rows in R's order, step 04 is identical.
-* The bigWig has the same values/intervals but is not byte-identical (different writer library).
+* The bigWig has the same values/intervals but is not byte-identical (different writer library). Its
+  zoom levels (summaries used by genome browsers when zoomed out) follow the libBigWig rule used by
+  deeptools: first level 16 × the mean interval width, then × 4 up to the longest chromosome.
 
 ## Validation
 

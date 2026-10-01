@@ -43,12 +43,13 @@ struct RunArgs {
     /// Output coverage bigWig (overrides the prefix-derived name)
     #[arg(long)]
     bw: Option<PathBuf>,
-    /// Total CPU cores to use (default: all cores). Decompression, processing and
-    /// output compression share this budget, e.g. set it to HTCondor/SLURM's allocated CPUs
+    /// Total CPU cores to use. Decompression, processing and output share this budget.
+    /// Default: SLURM_CPUS_PER_TASK, else OMP_NUM_THREADS (set by HTCondor to request_cpus),
+    /// else the cores available to the process
     #[arg(short, long)]
     threads: Option<usize>,
-    /// Modifications to extract: "brdu" (BrdU only, v18_Br output) or "bredu" (BrdU + EdU,
-    /// v18_BrE / DS421_v2 output). dorado (T+B., T+E.) and DNAscent (N+b?, N+e?) BAMs are
+    /// Modifications to extract: "brdu" (BrdU only, v18_Br output), "edu" (EdU only, v18_E output)
+    /// or "bredu" (BrdU + EdU, v18_BrE / DS421_v2 output). dorado (T+B., T+E.) and DNAscent (N+b?, N+e?) BAMs are
     /// recognised automatically from their MM tags
     #[arg(long, value_enum, default_value_t = Preset::Brdu)]
     preset: Preset,
@@ -94,6 +95,7 @@ struct RunArgs {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum Preset {
     Brdu,
+    Edu,
     Bredu,
 }
 
@@ -136,7 +138,8 @@ fn run(mut a: RunArgs) -> Result<()> {
     if a.rds.is_none() && a.bw.is_none() {
         bail!("nothing to do: give --out-prefix, --rds and/or --bw");
     }
-    let threads = a.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
+    let (threads, why) = thread_budget(a.threads);
+    eprintln!("using {threads} threads ({why})");
     let input: Box<dyn std::io::Read + Send> = if a.bam.as_os_str() == "-" {
         Box::new(std::io::stdin())
     } else {
@@ -154,6 +157,7 @@ fn run(mut a: RunArgs) -> Result<()> {
             } else {
                 match a.preset {
                     Preset::Brdu => vec!["B".into()],
+                    Preset::Edu => vec!["E".into()],
                     Preset::Bredu => vec!["B".into(), "E".into()],
                 }
             };
@@ -297,10 +301,26 @@ fn run(mut a: RunArgs) -> Result<()> {
         eprintln!("[{:.1}s] wrote {}", t0.elapsed().as_secs_f64(), p.display());
     }
     if let Some(p) = &a.bw {
-        cov.write_bigwig(p, 1)?;
+        cov.write_bigwig(p, threads)?;
         eprintln!("[{:.1}s] wrote {}", t0.elapsed().as_secs_f64(), p.display());
     }
     Ok(())
+}
+
+/// The core budget: `-t`, else the scheduler's allocation, else the available cores.
+fn thread_budget(cli: Option<usize>) -> (usize, String) {
+    if let Some(t) = cli {
+        return (t.max(1), "-t".into());
+    }
+    for var in ["SLURM_CPUS_PER_TASK", "OMP_NUM_THREADS"] {
+        if let Some(n) = std::env::var(var).ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+            if n > 0 {
+                return (n, var.into());
+            }
+        }
+    }
+    let n = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (n, "all available cores; set -t to your allocation".into())
 }
 
 fn read_header<R: std::io::Read>(r: &mut R, cov_bin: u32) -> Result<(Vec<String>, coverage::Coverage)> {

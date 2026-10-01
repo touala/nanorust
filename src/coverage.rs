@@ -87,16 +87,42 @@ impl Coverage {
         out
     }
 
+    /// Writes the bigWig. `threads` is the core budget: the calling thread drives the
+    /// writer and `threads - 1` runtime workers encode sections.
     pub fn write_bigwig(&self, path: &Path, threads: usize) -> Result<()> {
         let sizes: HashMap<String, u32> = self.chroms.iter().cloned().collect();
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(threads.max(1))
+            .worker_threads(threads.saturating_sub(1).max(1))
             .build()?;
-        let vals = BedParserStreamingIterator::wrap_infallible_iter(self.intervals().into_iter(), true);
-        let out = BigWigWrite::create_file(path, sizes)?;
+        let intervals = self.intervals();
+        let max_chrom = self.chroms.iter().map(|c| c.1).max().unwrap_or(0);
+        let mut out = BigWigWrite::create_file(path, sizes)?;
+        out.options.manual_zoom_sizes = Some(zoom_sizes(&intervals, max_chrom));
+        let vals = BedParserStreamingIterator::wrap_infallible_iter(intervals.into_iter(), true);
         out.write(vals, runtime).map_err(|e| anyhow!("bigWig write failed: {e}"))?;
         Ok(())
     }
+}
+
+/// Zoom levels chosen like libBigWig's `makeZoomLevels` (used by deeptools/pyBigWig):
+/// the first level is 16 x the mean interval width (at least 10 bp), each next one 4x
+/// larger, up to the longest chromosome and at most 10 levels. Data-dependent zooms
+/// avoid summarising a large genome at a fixed 160 bp resolution, which is slow.
+fn zoom_sizes(intervals: &[(String, Value)], max_chrom: u32) -> Vec<u32> {
+    let n = intervals.len().max(1) as f64;
+    let width: f64 = intervals.iter().map(|(_, v)| (v.end - v.start) as f64).sum();
+    let mean = ((width / n) as u32).saturating_mul(4);
+    let mut zoom: u32 = if mean.saturating_mul(4) > 10 { mean.saturating_mul(4) } else { 10 };
+    zoom = zoom.min(max_chrom.max(1));
+    let mut levels = Vec::new();
+    while levels.len() < 10 && zoom <= max_chrom.max(1) {
+        levels.push(zoom);
+        match zoom.checked_mul(4) {
+            Some(z) => zoom = z,
+            None => break,
+        }
+    }
+    levels
 }
 
 /// Reads all intervals of a bigWig: chrom -> (len, [(start, end, value)]).
