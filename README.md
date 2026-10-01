@@ -1,14 +1,15 @@
 # nanorust
 
-Fast Rust reimplementation of the nanoT BrdU parsing pipeline (steps 01–04 of
-`parsing_DoradoRemora_v18_Br.r` + step 02 `bamCoverage`):
+Fast Rust reimplementation of the nanoT parsing pipeline (steps 01–04 with the R parsers
+`parsing_DoradoRemora_v18_Br.r`, `_v18_E.r`, `_v18_BrE.r`, `parsing_DS421_v2.r`, and step 02
+`bamCoverage`), for BrdU and/or EdU calls from dorado/Remora or DNAscent:
 
 ```
-mod_calls_<exp>.bam  ──►  <prefix>_nanoT_alldata.rds   (same tibble as step 04 `alldata`)
-                     └─►  <prefix>.bw                  (same values as deeptools 3.5.4 bamCoverage)
+mod-call BAM  ──►  <prefix>_nanoT_alldata.rds   (same tibble as step 04 `alldata`)
+              └─►  <prefix>.bw                  (same values as deeptools 3.5.4 bamCoverage)
 ```
 
-One pass over the unsorted dorado BAM. No splitting, no sorting, no samtools/R/deeptools.
+One pass over the unsorted BAM. No splitting, no sorting, no samtools/R/deeptools.
 
 ## Install
 
@@ -20,10 +21,11 @@ download the archive for your platform from the
 tar xzf nanorust-*.tar.gz && ./nanorust --help
 ```
 
-**From source** (needs a Rust toolchain from <https://rustup.rs> and a C compiler, Linux or macOS):
+**From source** (needs Rust ≥ 1.85 from <https://rustup.rs> and a C compiler, Linux or macOS; with an
+older toolchain run `rustup update stable` first):
 
 ```bash
-cargo install --git https://github.com/touala/nanorust
+cargo install --git https://github.com/touala/nanorust          # add --force to upgrade
 ```
 
 ## Run
@@ -49,6 +51,7 @@ nanorust run -b mod_calls_FP27_ES1_tel1rif1rif2_RefBT1mono_modl610FT11.bam \
 | `--source` | auto | supplementary rules: `auto` (from the MM tags), `dorado`, `dnascent` |
 | `--binarise THR` | off | R's `binarise`/`bin_thr` for every modification: `signal<X>` uses `prob < THR ? 0 : 1` |
 | `--float-mode` | x87 | `x87` = R on x86-64 Linux (80-bit long double), `f64` = R on arm64 macOS |
+| `--rds-level` | 6 | gzip level of the RDS (R's `saveRDS` uses 6) |
 
 ### Modifications and BAM sources
 
@@ -86,6 +89,25 @@ Measured on Linux (human, 10,000 reads, `--preset bredu`, sampled every 0.2 s): 
 cores 0.97 / 1.10 (`-t 1`), 1.32 / 1.62 (`-t 2`), 1.97 / 2.33 (`-t 3`), 2.78 / 3.19 (`-t 4`).
 `scripts/cpu_monitor.sh -- nanorust run ...` reports this for any run. Results are identical for any `-t`.
 
+**Threads vs cores.** With `-t N` (N ≥ 3) the process has 2N+1 threads (N−1 decompression workers, N−1
+processing workers, reader, record splitter, main), but a worker must hold one of N−1 shared permits
+to do heavy work, so at most N−1 of them run at once and the others sleep. Schedulers measure cores
+actually used, not threads.
+
+**HTCondor.** Use the same number for `request_cpus` and `-t` (or omit `-t`: HTCondor's
+`OMP_NUM_THREADS` is used). What HTCondor checks:
+
+```bash
+condor_q <job> -af CpusUsage RequestCpus MemoryUsage RequestMemory        # running job
+condor_history <job> -af CpusUsage RequestCpus MemoryUsage RequestMemory  # finished job
+```
+
+`CpusUsage` should stay ≤ `RequestCpus`. Memory grows with the number of mappings (whole-genome yeast,
+1.3 M records: 0.9 GB peak); with `periodic_hold = (MemoryUsage > RequestMemory)` in the submit file,
+check `MemoryUsage` on a first run before reducing `request_memory`. Live view on the node:
+`htop -p $(pgrep -d, nanorust)` (press `H` for threads) or `pidstat -u -p $(pgrep -d, nanorust) 1`
+(100% = one core).
+
 `-b -` reads the BAM from stdin, e.g. streaming from a server without a local copy:
 
 ```bash
@@ -96,8 +118,9 @@ ssh server cat /path/mod_calls.bam | nanorust run -b - -o PREFIX
 
 ## What is replicated
 
-* **Filters** – mapped, non-secondary, not `chrM*`, has `MM`/`ML`; flag 0/16, or 2048/2064 when the
-  first `SA` entry is on the same chrom and strand; `end - start > min_len` with `rlen = M + D`.
+* **Filters** – mapped, non-secondary, not `chrM*`, has `MM`/`ML`, `end - start > min_len` with
+  `rlen = M + D`; dorado BAMs (v18): flag 0/16, or 2048/2064 when the first `SA` entry is on the same
+  chrom and strand; DNAscent BAMs (DS421_v2): any flag.
 * **Mod tags** – the selected calls over the target bases of the read-oriented sequence (complement on
   minus reads; listed positions for DNAscent's `N`), `.` → unreported = 0, `?` → dropped, `ML/255`;
   combined entries such as `C+mh` are supported.
@@ -105,8 +128,8 @@ ssh server cat /path/mod_calls.bam | nanorust run -b - -o PREFIX
   minus-strand flip using `max(read_pos)`), positions kept in `[start, end]`.
 * **Binning** – `floor((pos-1)/1000)*1000+1`, mean per bin; `med_signal`, `med_signalbin` with R's
   `mean`/`median` algorithms.
-* **supp_filter** – per read: total-or-null read-position overlap with the first mapping and
-  distance < `max_dist`.
+* **supp_filter** (dorado only) – per read: total-or-null read-position overlap with the first mapping
+  and distance < `max_dist`.
 * **RDS** – R serialization v3, gzip; tibble with the same columns, types, factor levels
   (all BAM references, strand `+ - *`) and nested `signalbin` tibbles.
 * **Coverage** – deeptools 3.5.4 `bamCoverage` defaults on `samtools view -F 260`: per 50 bp bin,
@@ -130,7 +153,8 @@ ssh server cat /path/mod_calls.bam | nanorust run -b - -o PREFIX
 ## Validation
 
 ```bash
-scripts/validate.sh sample/chrI.bam ref_nanoT_alldata.rds ref.bw chrI
+scripts/validate.sh sample/chrI.bam ref_nanoT_alldata.rds ref.bw chrI   # BrdU vs a v18 alldata, per chromosome
+Rscript scripts/compare_any.R new_alldata.rds ref_parsed.rds            # any layout, exact identical()
 ```
 
 * Whole genome, FP27_ES1_tel1rif1rif2 (1,296,021 records, 11 GB): the same 313,924 mappings as R;
