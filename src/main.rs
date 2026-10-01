@@ -47,12 +47,21 @@ struct RunArgs {
     /// output compression share this budget, e.g. set it to HTCondor/SLURM's allocated CPUs
     #[arg(short, long)]
     threads: Option<usize>,
-    /// Modification to extract, as in the MM tag: <base><strand><code>, e.g. T+B (BrdU),
-    /// T+e (EdU), C+m (5mC), C+h (5hmC), A+a (6mA), or a ChEBI code like C+17802
-    #[arg(long = "mod", default_value = "T+B")]
-    modification: String,
-    /// Binarise probabilities for signalbin: prob < THR -> 0, else 1 (R's binarise/bin_thr).
-    /// med_signal is still computed on raw probabilities, as in R
+    /// Modifications to extract: "brdu" (BrdU only, v18_Br output) or "bredu" (BrdU + EdU,
+    /// v18_BrE / DS421_v2 output). dorado (T+B., T+E.) and DNAscent (N+b?, N+e?) BAMs are
+    /// recognised automatically from their MM tags
+    #[arg(long, value_enum, default_value_t = Preset::Brdu)]
+    preset: Preset,
+    /// Override the preset with one or two modifications (comma-separated): B, E (dorado or
+    /// DNAscent form), or an explicit MM spec such as T+B, T+E, N+b. Both must be on the same base
+    #[arg(long = "mod", value_delimiter = ',', value_name = "MOD")]
+    mods: Vec<String>,
+    /// Supplementary rules: auto (from the MM tags), dorado (SA check + supp_filter, v18) or
+    /// dnascent (keep all, DS421_v2)
+    #[arg(long, value_enum, default_value_t = SourceArg::Auto)]
+    source: SourceArg,
+    /// Binarise probabilities for signalbin: prob < THR -> 0, else 1 (R's binarise/bin_thr),
+    /// applied to every modification. med_signal is still computed on raw probabilities, as in R
     #[arg(long, value_name = "THR")]
     binarise: Option<f64>,
     /// Drop supplementary mappings (default keeps them like parsing_DoradoRemora_v18_Br.r)
@@ -83,6 +92,19 @@ struct RunArgs {
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
+enum Preset {
+    Brdu,
+    Bredu,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SourceArg {
+    Auto,
+    Dorado,
+    Dnascent,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum FloatMode {
     X87,
     F64,
@@ -98,6 +120,8 @@ fn main() -> Result<()> {
 struct Batch {
     data: Vec<u8>,
     ends: Vec<usize>,
+    /// index of the batch's first record in the BAM (tie-breaker for R's stable sorts)
+    first: u64,
 }
 
 const BATCH_BYTES: usize = 8 << 20;
@@ -124,7 +148,22 @@ fn run(mut a: RunArgs) -> Result<()> {
         bin_size: a.bin_size,
         keep_supplementary: !a.no_supplementary,
         exclude_prefixes: a.exclude_prefix.clone(),
-        modspec: signal::ModSpec::parse(&a.modification)?,
+        mods: {
+            let list: Vec<String> = if !a.mods.is_empty() {
+                a.mods.clone()
+            } else {
+                match a.preset {
+                    Preset::Brdu => vec!["B".into()],
+                    Preset::Bredu => vec!["B".into(), "E".into()],
+                }
+            };
+            signal::ModTarget::parse_list(&list)?
+        },
+        source: match a.source {
+            SourceArg::Auto => None,
+            SourceArg::Dorado => Some(signal::Source::Dorado),
+            SourceArg::Dnascent => Some(signal::Source::DNAscent),
+        },
         bin_values: signal::Params::bin_values(a.binarise),
     };
     let cov_bin = a.cov_bin_size;
@@ -140,7 +179,7 @@ fn run(mut a: RunArgs) -> Result<()> {
             if !bam::read_raw_record(&mut reader, &mut buf)? {
                 break;
             }
-            w.record(&buf)?;
+            w.record(&buf, w.cnt.records)?;
         }
         let (maps, cnt) = (w.out, w.cnt);
         (chrom_names, cov, maps, cnt)
@@ -159,13 +198,15 @@ fn run(mut a: RunArgs) -> Result<()> {
         let (tx, rx) = crossbeam_channel::bounded::<Batch>(compute * 2);
         let (maps, cnt) = std::thread::scope(|s| -> Result<_> {
             let producer = s.spawn(move || -> Result<()> {
-                let mut batch = Batch { data: Vec::with_capacity(BATCH_BYTES), ends: Vec::new() };
+                let mut next = 0u64;
+                let mut batch = Batch { data: Vec::with_capacity(BATCH_BYTES), ends: Vec::new(), first: 0 };
                 while bam::read_raw_record(&mut reader, &mut batch.data)? {
                     batch.ends.push(batch.data.len());
+                    next += 1;
                     if batch.data.len() >= BATCH_BYTES {
                         let full = std::mem::replace(
                             &mut batch,
-                            Batch { data: Vec::with_capacity(BATCH_BYTES), ends: Vec::new() },
+                            Batch { data: Vec::with_capacity(BATCH_BYTES), ends: Vec::new(), first: next },
                         );
                         if tx.send(full).is_err() {
                             break;
@@ -186,8 +227,8 @@ fn run(mut a: RunArgs) -> Result<()> {
                         for batch in rx {
                             let _permit = budget.acquire();
                             let mut from = 0;
-                            for &to in &batch.ends {
-                                w.record(&batch.data[from..to])?;
+                            for (i, &to) in batch.ends.iter().enumerate() {
+                                w.record(&batch.data[from..to], batch.first + i as u64)?;
                                 from = to;
                             }
                         }
@@ -217,6 +258,33 @@ fn run(mut a: RunArgs) -> Result<()> {
         if counters.mm_overflow > 0 { format!(", {} skipped (more MM calls than target bases)", counters.mm_overflow) } else { String::new() }
     );
 
+    let c = &counters;
+    let detected = match (c.dorado > 0, c.dnascent > 0, a.source) {
+        (_, _, SourceArg::Dorado) => "dorado (forced)",
+        (_, _, SourceArg::Dnascent) => "DNAscent (forced)",
+        (true, false, _) => "dorado",
+        (false, true, _) => "DNAscent",
+        (true, true, _) => "mixed dorado + DNAscent",
+        (false, false, _) => "none",
+    };
+    let mod_names: Vec<String> = params.mods.iter().map(|m| m.name.clone()).collect();
+    eprintln!("modifications: {} | source: {detected}", mod_names.join(" + "));
+    if c.dorado > 0 && c.dnascent > 0 && matches!(a.source, SourceArg::Auto) {
+        eprintln!(
+            "warning: both dorado ({}) and DNAscent ({}) style records found; each record used its own supplementary rules",
+            c.dorado, c.dnascent
+        );
+    }
+    if c.partial_positions > 0 {
+        eprintln!(
+            "warning: {} mappings have positions where only one of the two modifications has a value (kept, the other is NA)",
+            c.partial_positions
+        );
+    }
+    if c.base_mismatch > 0 {
+        eprintln!("warning: {} records skipped: the two modifications are on different bases", c.base_mismatch);
+    }
+
     let (maps, missing_mq) = signal::supp_filter(maps, a.max_dist);
     if missing_mq > 0 {
         eprintln!("warning: {missing_mq} multi-mapping reads without SA tag kept without overlap check");
@@ -225,7 +293,7 @@ fn run(mut a: RunArgs) -> Result<()> {
 
     // Outputs run one after the other so they never exceed the core budget.
     if let Some(p) = &a.rds {
-        write_rds(p, &maps, &chrom_names, a.rds_level, threads)?;
+        write_rds(p, &maps, &chrom_names, &mod_names, a.rds_level, threads)?;
         eprintln!("[{:.1}s] wrote {}", t0.elapsed().as_secs_f64(), p.display());
     }
     if let Some(p) = &a.bw {
@@ -256,7 +324,8 @@ impl<'a> Worker<'a> {
         Worker { cov, params, chrom_names, scratch: Default::default(), out: Vec::new(), cnt: Default::default() }
     }
 
-    fn record(&mut self, data: &[u8]) -> Result<()> {
+    /// `ord` is the record's index in the BAM.
+    fn record(&mut self, data: &[u8], ord: u64) -> Result<()> {
         let rec = bam::Record::parse(data)?;
         self.cnt.records += 1;
         if rec.flag & (bam::FLAG_UNMAPPED | bam::FLAG_SECONDARY) != 0 || rec.ref_id < 0 {
@@ -264,7 +333,8 @@ impl<'a> Worker<'a> {
         }
         self.cov.add(&rec);
         let name = &self.chrom_names[rec.ref_id as usize];
-        if let Some(m) = signal::extract(&rec, name, self.params, &mut self.scratch, &mut self.cnt) {
+        if let Some(mut m) = signal::extract(&rec, name, self.params, &mut self.scratch, &mut self.cnt) {
+            m.ord = ord;
             self.out.push(m);
         }
         Ok(())
@@ -273,9 +343,16 @@ impl<'a> Worker<'a> {
 
 /// Serializes in memory, then gzip-compresses chunks in parallel as
 /// concatenated gzip members (read transparently by R's gzfile/readRDS).
-fn write_rds(path: &Path, maps: &[signal::Mapping], levels: &[String], level: u32, threads: usize) -> Result<()> {
+fn write_rds(
+    path: &Path,
+    maps: &[signal::Mapping],
+    levels: &[String],
+    mods: &[String],
+    level: u32,
+    threads: usize,
+) -> Result<()> {
     let mut w = rds::RdsWriter::new(Vec::with_capacity(64 << 20))?;
-    w.write_alldata(maps, levels)?;
+    w.write_alldata(maps, levels, mods)?;
     let raw = w.finish();
     const CHUNK: usize = 16 << 20;
     let chunks: Vec<&[u8]> = raw.chunks(CHUNK).collect();

@@ -1,11 +1,11 @@
 [package]
 name = "nanorust"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/touala/nanorust"
 readme = "README.md"
-description = "Fast Rust reimplementation of the nanoT BrdU parsing pipeline (dorado mod-call BAM -> alldata.rds + coverage bigWig)"
+description = "Fast Rust reimplementation of the nanoT parsing pipelines (dorado / DNAscent BrdU and EdU mod-call BAM -> alldata.rds + coverage bigWig)"
 
 [dependencies]
 anyhow = "1.0.104"

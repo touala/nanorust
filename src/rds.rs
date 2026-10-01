@@ -135,12 +135,27 @@ impl<W: Write> RdsWriter<W> {
         self.end_attrs()
     }
 
-    /// The step-04 `alldata` tibble:
-    /// read_id, flag, chrom, strand, start, end, signalbin, med_signal, med_signalbin
-    pub fn write_alldata(&mut self, maps: &[Mapping], chrom_levels: &[String]) -> io::Result<()> {
+    /// The step-04 `alldata` tibble. With one modification X (v18_Br / v18_E):
+    /// read_id, flag, chrom, strand, start, end, signalbin(positions, signalX), med_signal, med_signalbin.
+    /// With two modifications X, Y (v18_BrE / DS421_v2):
+    /// ..., signalbin(positions, signalX, signalY), med_signalXbin, med_signalYbin.
+    pub fn write_alldata(&mut self, maps: &[Mapping], chrom_levels: &[String], mods: &[String]) -> io::Result<()> {
         let n = maps.len();
+        let nm = mods.len();
+        let mut cols: Vec<String> =
+            ["read_id", "flag", "chrom", "strand", "start", "end", "signalbin"].iter().map(|s| s.to_string()).collect();
+        if nm == 1 {
+            cols.push("med_signal".into());
+            cols.push("med_signalbin".into());
+        } else {
+            cols.extend(mods.iter().map(|m| format!("med_signal{m}bin")));
+        }
+        let mut bin_cols = vec!["positions".to_string()];
+        bin_cols.extend(mods.iter().map(|m| format!("signal{m}")));
+        let bin_cols: Vec<&str> = bin_cols.iter().map(|s| s.as_str()).collect();
+
         self.int(VECSXP | IS_OBJECT | HAS_ATTR)?;
-        self.len(9)?;
+        self.len(cols.len())?;
         // read_id
         self.int(STRSXP)?;
         self.len(n)?;
@@ -153,22 +168,25 @@ impl<W: Write> RdsWriter<W> {
         self.factor(maps.iter().map(|m| if m.minus { 2 } else { 1 }), &strand_levels)?;
         self.realsxp(maps.iter().map(|m| m.start as f64))?;
         self.realsxp(maps.iter().map(|m| m.end as f64))?;
-        // signalbin: list of tibbles (positions, signalB)
+        // signalbin: list of tibbles (positions, signalX[, signalY])
         self.int(VECSXP)?;
         self.len(n)?;
         for m in maps {
             self.int(VECSXP | IS_OBJECT | HAS_ATTR)?;
-            self.len(2)?;
+            self.len(1 + nm)?;
             self.realsxp(m.bins.iter().map(|b| b.0))?;
-            self.realsxp(m.bins.iter().map(|b| b.1))?;
-            self.tibble_attrs(&["positions", "signalB"], m.bins.len(), false)?;
+            for k in 0..nm {
+                self.realsxp(m.bins.iter().map(|b| b.1[k]))?;
+            }
+            self.tibble_attrs(&bin_cols, m.bins.len(), false)?;
         }
-        self.realsxp(maps.iter().map(|m| m.med_signal))?;
-        self.realsxp(maps.iter().map(|m| m.med_signalbin))?;
-        self.tibble_attrs(
-            &["read_id", "flag", "chrom", "strand", "start", "end", "signalbin", "med_signal", "med_signalbin"],
-            n,
-            true,
-        )
+        if nm == 1 {
+            self.realsxp(maps.iter().map(|m| m.med_signal))?;
+        }
+        for k in 0..nm {
+            self.realsxp(maps.iter().map(|m| m.med_signalbin[k]))?;
+        }
+        let cols: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+        self.tibble_attrs(&cols, n, true)
     }
 }

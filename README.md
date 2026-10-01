@@ -44,9 +44,30 @@ nanorust run -b mod_calls_FP27_ES1_tel1rif1rif2_RefBT1mono_modl610FT11.bam \
 | `--bin-size` | 1000 | signalbin bin size |
 | `--cov-bin-size` | 50 | bamCoverage `--binSize` |
 | `--exclude-prefix` | chrM | chromosomes excluded from the signal (step 01 `^chrM`) |
-| `--mod` | T+B | modification to extract, as in the MM tag: `T+B` (BrdU), `T+e` (EdU), `C+m`, `C+h`, `A+a`, `C+17802`, … |
-| `--binarise THR` | off | R's `binarise`/`bin_thr`: `signalB` uses `prob < THR ? 0 : 1` (`med_signal` stays raw) |
+| `--preset` | brdu | `brdu` (BrdU) or `bredu` (BrdU + EdU), see below |
+| `--mod` | | override the preset with one or two modifications: `B`, `E`, or MM specs like `T+B,T+E` (same base) |
+| `--source` | auto | supplementary rules: `auto` (from the MM tags), `dorado`, `dnascent` |
+| `--binarise THR` | off | R's `binarise`/`bin_thr` for every modification: `signal<X>` uses `prob < THR ? 0 : 1` |
 | `--float-mode` | x87 | `x87` = R on x86-64 Linux (80-bit long double), `f64` = R on arm64 macOS |
+
+### Modifications and BAM sources
+
+The producer of the BAM is recognised from its `MM` tags, and the matching R parser is reproduced:
+
+| BAM | MM entries | supplementary rules | `--preset brdu` | `--preset bredu` |
+|---|---|---|---|---|
+| dorado / Remora | `T+B.` `T+E.` | flag 0/16, or 2048/2064 with first `SA` entry on the same chrom/strand, then `supp_filter` | `parsing_DoradoRemora_v18_Br.r` | `parsing_DoradoRemora_v18_BrE.r` |
+| DNAscent 4 | `N+b?` `N+e?` | all mapped, non-secondary records; no `supp_filter` | — | `parsing_DS421_v2.r` |
+
+Output columns: with one modification X, `signalbin(positions, signalX)`, `med_signal`, `med_signalbin`
+(v18 layout); with two modifications X and Y, `signalbin(positions, signalX, signalY)`,
+`med_signalXbin`, `med_signalYbin` (BrE / DS421 layout). `B`/`b` and `E`/`e` are custom codes of these
+models (not in the SAMtags table), so both spellings map to the `B` and `E` columns.
+
+With two modifications, a position is kept when either one has a value (in these BAMs both always list the
+same positions). Otherwise the missing value is `NA`, an empty bin mean is `NaN` and an empty median is
+`NA`, as in R, and a warning reports how many mappings were affected. Both modifications must be on the
+same base.
 
 ### CPU budget (`-t`)
 
@@ -74,9 +95,9 @@ ssh server cat /path/mod_calls.bam | nanorust run -b - -o PREFIX
 
 * **Filters** – mapped, non-secondary, not `chrM*`, has `MM`/`ML`; flag 0/16, or 2048/2064 when the
   first `SA` entry is on the same chrom and strand; `end - start > min_len` with `rlen = M + D`.
-* **Mod tags** – the `--mod` calls (default `T+B`) over the target bases of the read-oriented
-  sequence (complement on minus reads; every base for `N`), `.` → unreported = 0, `?` → dropped,
-  `ML/255`; combined entries such as `C+mh` are supported.
+* **Mod tags** – the selected calls over the target bases of the read-oriented sequence (complement on
+  minus reads; listed positions for DNAscent's `N`), `.` → unreported = 0, `?` → dropped, `ML/255`;
+  combined entries such as `C+mh` are supported.
 * **CIGAR mapping** – `parseCigar` semantics (M maps, I/S advance query, D/N advance reference,
   minus-strand flip using `max(read_pos)`), positions kept in `[start, end]`.
 * **Binning** – `floor((pos-1)/1000)*1000+1`, mean per bin; `med_signal`, `med_signalbin` with R's
@@ -90,8 +111,9 @@ ssh server cat /path/mod_calls.bam | nanorust run -b - -o PREFIX
 
 ## Known, intended differences to the R output
 
-* **Row order**: rows are sorted by `(chrom, read_id, flag, start)` over the whole file; R orders
-  within each 10k-read chunk. `supp_filter` also runs per whole read instead of per chunk.
+* **Row order**: rows are sorted by `(chrom, read_id, flag, start)` over the whole file, ties in BAM
+  order (R's stable `arrange()`); R orders within each 10k-read chunk, so the order matches R exactly
+  when R processed the BAM as a single chunk. `supp_filter` also runs per whole read instead of per chunk.
 * **Floating point**: R's `mean()` accumulates in `long double`, which is 80-bit x87 on x86-64
   Linux. nanorust emulates it in software (default `--float-mode x87`), so values are bit-identical
   to R on Linux on any machine; `--float-mode f64` reproduces R on Apple Silicon instead.
@@ -110,7 +132,10 @@ scripts/validate.sh sample/chrI.bam ref_nanoT_alldata.rds ref.bw chrI
   coverage bigWig identical at every base on all 17 chromosomes (same intervals).
 * chrI, chrVI, chrXII (105,307 mappings) with `--float-mode x87`: `alldata` is `identical()` to the
   Linux R output after ordering, every value bit for bit.
-* Other modifications and combined MM codes: end-to-end tests on relabelled/rewritten BAMs.
+* BrdU + EdU (`--preset bredu`) on human CHM13 test sets, dorado and DNAscent, 1,000 and 10,000 reads
+  (18,781 mappings): the whole `alldata` is `identical()` to the R parser output (minus its step-03
+  `signal` column), row order included.
+* Other modifications, combined MM codes and edge cases: end-to-end tests on rewritten BAMs.
 
 ## License
 
